@@ -1,0 +1,303 @@
+#!/bin/bash
+
+########## Configuration / Usage Text / Etc below ##############
+SCRIPT=$(basename ${0});
+REPOSITORY=$(hostname | cut -d'-' -f 1)
+HOSTNAME=$(hostname)
+DEFAULTORG="development"
+DEFAULTSERVER="github.cgraphics.com"
+DEFAULTENVIRON="live"
+DOMAIN=$(dnsdomainname)
+USERNAME=$(whoami)
+
+USAGE=$(cat <<EOF_USAGE
+
+USAGE: ${SCRIPT} <options>
+
+The following options are supported:
+
+--help                       : Displays this help message.
+--branch [branch to deploy]  : No Default, must specify.
+--deployed                   : Lists information about the currently
+                             : deployed tag for the current server.
+--org [org in github]        : Defaults to "${DEFAULTORG}".
+--repo [name of repository]  : Defaults to "${REPOSITORY}".
+--server [servername]        : Defaults to "${DEFAULTSERVER}".
+
+Default user for all git operations will be the currently
+logged in user (${USERNAME}).
+
+EOF_USAGE
+)
+
+GITCONFIG=$(cat <<EOF_GITCONFIG
+
+You need to configure your git identity and try again.
+This information is required once for identifying who is
+responsible for each tag this script creates during a deploy.
+
+Example:
+$ git config --global user.name "Classic Graphics"
+$ git config --global user.email "youremail@knowclassic.com"
+
+Templates to copy/paste:
+
+git config --global user.name
+git config --global user.email
+
+EOF_GITCONFIG
+)
+
+######### Shouldn't need to change anything below #########
+NUMARGS="$#"
+
+# Print usage message and exit
+print_usage () {
+  echo "${USAGE}" >&2
+}
+
+# return given variable if not in error 
+assign_value () {
+  case ${1} in
+    --*)
+      print_usage
+      exit 4
+      ;;
+    *)
+      echo ${1}
+      ;;
+  esac
+}
+
+# Function to display the deployed version of the site
+# Along with other relevant information. 
+display_deployed () {
+  DEPLOYED=$(sed -n '/START DEPLOY INFO/,/END DEPLOY INFO/p' /var/www/.htaccess | tr -d [:space:])
+  if [ x${DEPLOYED} != "x" ]; then
+    IFS=$'#'
+    set ${DEPLOYED}
+
+    DEPINFO=$(cat <<EOF_DEPLOY
+Current Deploy Information for this server:
+
+     Deploying user: ${4}
+     Drupal Version: ${7}.x
+        Environment: ${5}
+       Tag Deployed: ${5}-${6}
+    Branch Deployed: ${8}
+         Repository: ${9}
+GitHub Organization: ${10}
+
+EOF_DEPLOY
+)
+  else
+    DEPINFO="Sorry, no information yet available."
+  fi
+
+  echo -e "${DEPINFO}\n\n"
+  exit
+}
+
+# parse the command line
+# for each command line argument that requires
+# a second parameter, assign "BAD" if it's empty
+# or begins with -- (ie picking another argument)
+while [ "${1}" != "" ]; do
+  case ${1} in
+    --branch)
+      BRANCH=$(assign_value ${2})
+      shift 2
+      ;;
+    --deployed)
+      display_deployed
+      ;;
+    --org)
+      if [ x"${ORG}" == "x" ]; then
+        ORG=$(assign_value ${2})
+      fi
+      shift 2
+      ;;
+    --repo)
+      REPO=$(assign_value ${2})
+      shift 2
+      ;;
+    --server)
+      if [ x"${SERVER}" == "x" ]; then
+        SERVER="git@"$(assign_value ${2})
+      fi
+      shift 2
+      ;;
+    --help|--*)
+      print_usage
+      exit 0
+      ;;
+  esac
+done
+
+if [ "${ORG}" == "" ]; then
+  ORG="${DEFAULTORG}"
+fi
+
+if [ "${REPO}" == "" ]; then
+  if [[ "${HOSTNAME}" =~ "-" ]]; then
+    REPO=$(hostname | cut -d'-' -f 1)
+  else
+    REPO="${HOSTNAME}"
+  fi
+fi
+
+if [[ "${HOSTNAME}" =~ "-" ]]; then
+  ENVIRON=$(hostname | cut -d'-' -f 2)
+else
+  ENVIRON="${DEFAULTENVIRON}"
+fi
+
+if [ "${SERVER}" == "" ]; then
+  SERVER="git@${DEFAULTSERVER}"
+fi
+
+if [ "${BRANCH}" == "" ]; then
+  if [ "${ENVIRON}" != "${DEFAULTENVIRON}" ]; then
+    print_usage
+    exit 3
+  else
+    BRANCH="master";
+  fi
+fi
+
+# We need arguments!
+if [ ${NUMARGS} -eq 0 ] && [ "${ENVIRON}" != "${DEFAULTENVIRON}" ]; then
+  print_usage
+  exit 2
+fi
+
+if [ ! -e "${HOME}/.gitconfig" ]; then
+  echo "${GITCONFIG}" >&2;
+  exit 1;
+fi
+
+if [ -d /tmp/clone ]; then
+  echo "Removing existing clone directory..."
+  sudo rm -rf /tmp/clone
+fi
+
+GITURL="git+ssh://${SERVER}/${ORG}/${REPO}.git"
+
+echo "Cloning ${BRANCH}..."
+mkdir /tmp/clone
+
+git clone -b ${BRANCH} ${GITURL} /tmp/clone
+
+cd /tmp/clone
+
+TAG=$(date +%Y-%m-%d-%H-%M)
+HASH=$(git log "${BRANCH}" -n 1 --pretty=format:%h)
+
+echo "Tagging local clone..."
+git tag -a -m "${BRANCH} ${HASH} to ${ENVIRON} by ${USERNAME}" "${ENVIRON}-${TAG}"
+
+echo "Pushing tag to origin..."
+git push origin "${ENVIRON}-${TAG}"
+
+echo "Determining Drupal version..."
+DVERS=$(drush status | sed -e "s/ *//g;" | grep 'Drupalversion' | cut --delimiter=: -f2 | cut --delimiter=. -f1)
+
+if [ -r /opt/patches/D${DVERS}-ssl.patch ]; then
+  echo "Patching Drupal ${DVERS}.x core to support SSL database connection..."
+  
+  # Apply Drupal ${DVERS} patch to source
+  patch -d /tmp/clone -p1 < /opt/patches/D${DVERS}-ssl.patch
+elif [ "${DVERS}" == "7" ]; then
+  # Find the settings file for site
+  SETTINGSFILE=$(find /var/www -type f -name settings.php 2> /dev/null)
+  
+  echo "Checking Drupal ${DVERS}.x ${SETTINGSFILE} for previously applied patch..."
+  
+  # Look for the patch
+  PATCHED=$(grep -A 15 "^\$databases" ${SETTINGSFILE} | grep "'pdo'")
+  
+  # was it found?
+  if [ "${PATCHED}" == "" ]; then
+    # Nope
+    echo "${SETTINGSFILE} not previously patched, patching..."
+    
+    # Define the SSL options for PDO connection
+    PDOOPTIONS=$(cat << EOF
+  'pdo' => array ( PDO::MYSQL_ATTR_SSL_CA => '/etc/ssl/mysql/ca.crt', PDO::MYSQL_ATTR_SSL_CERT => '/etc/ssl/mysql/${HOSTNAME}.${DOMAIN}.crt', PDO::MYSQL_ATTR_KEY => '/etc/ssl/mysql/${HOSTNAME}.${DOMAIN}.key', ),
+EOF
+)
+
+    # Find the location in file to insert PDO SSL options
+    INSERTPOS=$(( $(grep -A0 -B0 -n1 "^\$databases" ${SETTINGSFILE} | cut -d: -f1) + 1 ))
+    
+    # Patch the file
+    sed -i "${INSERTPOS}i${PDOOPTIONS}" ${SETTINGSFILE}
+  else
+    # Already patched
+    echo "${SETTINGSFILE} already patched, skipping..."
+  fi
+else
+  # We have an unsupported install, Red Flag!!
+  echo "Error: No patch found for Drupal ${DVERS}.x!"
+  echo "Processing aborted!"
+  echo "EXAMINE SOURCE in /tmp/clone!!"
+  exit 2
+fi
+
+echo "Removing old backup DB files..."
+find /var/dbbackup/* -mtime +1 -delete
+
+echo "Creating DB Backup..."
+cd /var/www
+drush sql-dump --result-file='/var/dbbackup/'${ENVIRON}'-'${TAG}'.sql'
+
+echo "Compressing (bzip2) sql backup..."
+bzip2 /var/dbbackup/${ENVIRON}-${TAG}.sql
+
+echo "Configuring permissions..."
+if [ "${ENVIRON}" == "live" ]; then
+  sudo chown -R www-data:www-data /tmp/clone
+  USER='-u www-data'
+else
+  USER=''
+fi
+
+# Set permissions and sync
+sudo chmod -R a-srwx /tmp/clone
+sudo chmod -R ug+rX,g+w /tmp/clone
+for D in `find /tmp/clone -type d`; do
+  sudo chmod g+s ${D}
+done
+
+echo "Syncing ${BRANCH} to /var/www..."
+CMD='sudo '${USER}' rsync -rl --exclude="private" --exclude=".git" --exclude=".gitignore" /tmp/clone/ /var/www/'
+eval ${CMD}
+
+# Just so we don't throw errors below when bash can't find the /tmp/clone directory
+cd ${HOME}
+
+echo "Removing clone directory..."
+sudo rm -rf /tmp/clone
+
+# Build a deploy Description block to place at the end of the .htaccess file
+DEPLOY="## START DEPLOY INFO
+# ${USERNAME}
+# ${ENVIRON}
+# ${TAG}
+# ${DVERS}
+# ${BRANCH}
+# ${REPOSITORY}
+# ${ORG}
+## END DEPLOY INFO
+"
+
+# Remove the previous DEPLOY INFO
+sed -i '/START DEPLOY INFO/,/END DEPLOY INFO/d' /var/www/.htaccess
+
+# add the info to the end of the .htaccess file
+echo ${DEPLOY} >> /var/www/.htaccess
+
+echo "Launch complete!"
+echo "Template for pasting to a related issue:"
+echo "Deployed ${HASH} with tag ${ENVIRON}-${TAG}. - ${ORG^^}/${REPO^^}"
+echo
