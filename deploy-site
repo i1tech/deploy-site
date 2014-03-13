@@ -1,17 +1,17 @@
 #!/bin/bash
 
 ########## Configuration / Usage Text / Etc below ##############
-SCRIPT=$(basename ${0});
+SCRIPT=$(basename ${0})
 REPOSITORY=$(hostname | cut -d'-' -f 1)
 HOSTNAME=$(hostname)
-DEFAULTORG="development"
+DEFAULTSERVER="GIT SERVER CHANGE ME"
 DEFAULTENVIRON="live"
+DBBACKUPLOC="/var/dbbackup"
 DOMAIN=$(dnsdomainname)
-USERNAME=$(whoami)
-
-###### Destination Server Configuration
-DEFAULTSERVER="github.com"
-PORT="" ##### Custom ssh ports must include colon (ex. PORT=":7999")
+BASEHOSTNAME="$(hostname | cut -d'-' -f 1).${DOMAIN}"
+USERNAME=$(whoami | sed 's/_admin//g')
+PORT=                       # GIT SERVER PORT NUMBER - CHANGE OR LEAVE BLANK FOR DEFAULT
+WEBROOT="/var/www"          # CHANGE IF DIFFERENT
 
 USAGE=$(cat <<EOF_USAGE
 
@@ -20,13 +20,20 @@ USAGE: ${SCRIPT} <options>
 The following options are supported:
 
 --help                       : Displays this help message.
---branch [branch to deploy]  : No Default, must specify.
+--branch [branch to deploy]  : Defaults to master on live sites,
+                             : otherwise MUST specify.
 --deployed                   : Lists information about the currently
                              : deployed tag for the current server.
 --no-backup                  : Skips creating DB Backup (Not recommended)
---org [org in github]        : Defaults to "${DEFAULTORG}".
+--project [project on jira]  : Defaults to "~${USERNAME}" on development
+                             : systems and MUST be specified on produc-
+                             : tion systems.
 --repo [name of repository]  : Defaults to "${REPOSITORY}".
 --server [servername]        : Defaults to "${DEFAULTSERVER}".
+--no-cc-all                  : Do NOT run 'drush cc all' after deploy
+--cleanup                    : Remove files no longer in repository in
+                             : the '/var/www/sites/all' and '/var/www/profile'
+                             : trees only.
 
 Default user for all git operations will be the currently logged in
 user (${USERNAME}).
@@ -41,21 +48,22 @@ This information is required once for identifying who is
 responsible for each tag this script creates during a deploy.
 
 Example:
-$ git config --global user.name "Classic Graphics"
-$ git config --global user.email "youremail@knowclassic.com"
-
-Templates to copy/paste:
-
-git config --global user.name
-git config --global user.email
+$ git config --global user.name "Your Name"
+$ git config --global user.email "youremail@yourdomain.com"
 
 EOF_GITCONFIG
 )
 
 # Default to creating a DB Backup
-SKIPDB=false
+SKIPDB=0
 
-######### Shouldn't need to change anything below #########
+# Default to running drush cc all
+CCALL=0
+
+# Default to NOT cleaning up (current method)
+CLEANUP=1
+
+###### Shouldn't need to change anything below here #######
 NUMARGS="$#"
 
 # Print usage message and exit
@@ -79,7 +87,7 @@ assign_value () {
 # Function to display the deployed version of the site
 # Along with other relevant information. 
 display_deployed () {
-  DEPLOYED=$(sed -n '/START DEPLOY INFO/,/END DEPLOY INFO/p' /var/www/.htaccess | tr -d [:space:])
+  DEPLOYED=$(sed -n '/START DEPLOY INFO/,/END DEPLOY INFO/p' ${WEBROOT}/.htaccess | tr -d [:space:])
   if [ x${DEPLOYED} != "x" ]; then
     IFS=$'#'
     set ${DEPLOYED}
@@ -93,7 +101,7 @@ Current Deploy Information for this server:
        Tag Deployed: ${5}-${6}
     Branch Deployed: ${8}
          Repository: ${9}
-GitHub Organization: ${10}
+      Stash Project: ${10}
 
 EOF_DEPLOY
 )
@@ -112,7 +120,7 @@ EOF_DEPLOY
 while [ "${1}" != "" ]; do
   case ${1} in
     --no-backup)
-      SKIPDB=true;
+      SKIPDB=1
       shift 1
       ;;
     --branch)
@@ -122,10 +130,8 @@ while [ "${1}" != "" ]; do
     --deployed)
       display_deployed
       ;;
-    --org)
-      if [ x"${ORG}" == "x" ]; then
-        ORG=$(assign_value ${2})
-      fi
+    --project)
+      PROJ=$(assign_value ${2})
       shift 2
       ;;
     --repo)
@@ -134,9 +140,17 @@ while [ "${1}" != "" ]; do
       ;;
     --server)
       if [ x"${SERVER}" == "x" ]; then
-        SERVER="git@"$(assign_value ${2})
+        SERVER=${USERNAME}"@"$(assign_value ${2})
       fi
       shift 2
+      ;;
+    --no-cc-all)
+      CCALL=1
+      shift 1
+      ;;
+    --cleanup)
+      CLEANUP=0
+      shift 1
       ;;
     --help|--*)
       print_usage
@@ -144,10 +158,6 @@ while [ "${1}" != "" ]; do
       ;;
   esac
 done
-
-if [ "${ORG}" == "" ]; then
-  ORG="${DEFAULTORG}"
-fi
 
 if [ "${REPO}" == "" ]; then
   if [[ "${HOSTNAME}" =~ "-" ]]; then
@@ -164,7 +174,16 @@ else
 fi
 
 if [ "${SERVER}" == "" ]; then
-  SERVER="git@${DEFAULTSERVER}"
+  SERVER="${USERNAME}@${DEFAULTSERVER}"
+fi
+
+if [ "${PROJ}" == "" ]; then
+  if [ "${ENVIRON}" != "${DEFAULTENVIRON}" ]; then
+    PROJ="~${USERNAME}"
+  else
+    echo "Must specify --project switch in live environment"
+    exit
+  fi
 fi
 
 if [ "${BRANCH}" == "" ]; then
@@ -177,7 +196,7 @@ if [ "${BRANCH}" == "" ]; then
 fi
 
 # We need arguments!
-if [ ${NUMARGS} -eq 0 ] && [ "${ENVIRON}" != "${DEFAULTENVIRON}" ]; then
+if [ ${NUMARGS} -le 1 ]; then
   print_usage
   exit 2
 fi
@@ -192,7 +211,7 @@ if [ -d /tmp/clone ]; then
   sudo rm -rf /tmp/clone
 fi
 
-GITURL="git+ssh://${SERVER}${PORT}/${ORG}/${REPO}.git"
+GITURL="git+ssh://${SERVER}:${PORT}/${PROJ}/${REPO}.git"
 
 echo "Cloning ${BRANCH}..."
 mkdir /tmp/clone
@@ -215,17 +234,22 @@ DVERS=$(drush status | sed -e "s/ *//g;" | grep 'Drupalversion' | cut --delimite
 
 if [ -r /opt/patches/D${DVERS}-ssl.patch ]; then
   echo "Patching Drupal ${DVERS}.x core to support SSL database connection..."
-  
+
   # Apply Drupal ${DVERS} patch to source
   patch -d /tmp/clone -p1 < /opt/patches/D${DVERS}-ssl.patch
 elif [ "${DVERS}" == "7" ]; then
   # Find the settings file for site
-  SETTINGSFILE=$(find /var/www -type f -name settings.php 2> /dev/null)
+  SETTINGSFILE=$(sudo find ${WEBROOT} -type f -name settings.php 2> /dev/null)
+
+  if [ "${SETTINGSFILE}" == "" ]; then
+    echo "Could not find a settings.php file, please correct and try again!"
+    exit 3
+  fi
 
   echo "Checking Drupal ${DVERS}.x ${SETTINGSFILE} for previously applied patch..."
 
   # Look for the patch
-  PATCHED=$(grep -A 15 "^\$databases" ${SETTINGSFILE} | grep "'pdo'")
+  PATCHED=$(sudo grep -A 15 "^\$databases" ${SETTINGSFILE} | grep "'pdo'")
 
   # was it found?
   if [ "${PATCHED}" == "" ]; then
@@ -234,7 +258,7 @@ elif [ "${DVERS}" == "7" ]; then
 
     # Define the SSL options for PDO connection
     PDOOPTIONS=$(cat << EOF
-  'pdo' => array ( PDO::MYSQL_ATTR_SSL_CA => '/etc/ssl/mysql/ca.crt', PDO::MYSQL_ATTR_SSL_CERT => '/etc/ssl/mysql/${HOSTNAME}.${DOMAIN}.crt', PDO::MYSQL_ATTR_SSL_KEY => '/etc/ssl/mysql/${HOSTNAME}.${DOMAIN}.key', ),
+  'pdo' => array ( PDO::MYSQL_ATTR_SSL_CA => '/etc/ssl/mariadb/ca.crt', PDO::MYSQL_ATTR_SSL_CERT => '/etc/ssl/mariadb/${HOSTNAME}.${DOMAIN}.crt', PDO::MYSQL_ATTR_SSL_KEY => '/etc/ssl/mariadb/${HOSTNAME}.${DOMAIN}.key', ),
 EOF
 )
 
@@ -242,7 +266,7 @@ EOF
     INSERTPOS=$(( $(grep -A0 -B0 -n1 "^\$databases" ${SETTINGSFILE} | cut -d: -f1) + 1 ))
 
     # Patch the file
-    sed -i "${INSERTPOS}i${PDOOPTIONS}" ${SETTINGSFILE}
+    sudo sed -i "${INSERTPOS}i${PDOOPTIONS}" ${SETTINGSFILE}
   else
     # Already patched
     echo "${SETTINGSFILE} already patched, skipping..."
@@ -255,39 +279,63 @@ else
   exit 2
 fi
 
-if [[ ! ${SKIPDB} ]]; then
+if [ ${SKIPDB} -eq 0 ]; then
   echo "Removing old backup DB files..."
-  find /var/dbbackup/* -mtime +1 -delete
+  GARBAGE=$(sudo find ${DBBACKUPLOC}/* -mtime +1 -delete 2&>1)
 
-  echo "Creating DB Backup..."
-  cd /var/www
-  drush sql-dump --result-file='/var/dbbackup/'${ENVIRON}'-'${TAG}'.sql'
-
-  echo "Compressing (bzip2) sql backup..."
-  bzip2 /var/dbbackup/${ENVIRON}-${TAG}.sql
+  echo "Creating/Compressing (bzip2) DB Backup..."
+  cd ${WEBROOT}
+  drush sql-dump | bzip2 > ${DBBACKUPLOC}/${ENVIRON}-${TAG}.sql.bz2
 else
-  echo "Skipped DB Backup . . ."
+  echo "Skipped DB Backup..."
 fi
 
 echo "Configuring permissions..."
 if [ "${ENVIRON}" == "live" ]; then
   sudo chown -R www-data:www-data /tmp/clone
-  USER='-u www-data'
 else
-  sudo chgrp -R www-data /tmp/clone
-  USER=''
+  USER=$(whoami)
+  sudo chown -R ${USER}:www-data /tmp/clone
 fi
 
 # Set permissions and sync
 sudo chmod -R a-srwx /tmp/clone
 sudo chmod -R ug+rX,g+w /tmp/clone
+
 for D in `find /tmp/clone -type d`; do
   sudo chmod g+s ${D}
 done
 
-echo "Syncing ${BRANCH} to /var/www..."
-CMD='sudo '${USER}' rsync -rpl --exclude="private" --exclude=".git" --exclude=".gitignore" /tmp/clone/ /var/www/'
-eval ${CMD}
+# Should we try to cleanup, and remove files not within
+# this deploy (ie. removed from repository)?
+if [ ${CLEANUP} -eq 0 ]; then
+  # our list of excluded items.
+  EXCLUDE='-x "libraries" -x "files" -x "lost+found" -x "10.18.20.*" -x "settings.php*" -x "preview" -x "*.'${DOMAIN}'" -x ".gitignore" -x ".git" -x ".ht*"'
+
+  # For now, this just displays the files that would be deleted, doesn't actually delete them.
+  FILES=$(eval "sudo diff -r ${EXCLUDE} /tmp/clone ${WEBROOT} | sed '/Binary files/d; s/://g' | grep -v '/tmp/clone' | awk '{print \$3 \"/\" \$4}'")
+
+  # Once devs are satisfied the above list of files is correct, we ca enable the actual removal of files in the
+  # following code to do the actual deletions.
+  echo "Would remove the following files/directories:"
+
+  # save the current IFS and define the new one as newline
+  IFSSAVE=${IFS}
+  IFS=$'\n'
+
+  # Loop through the files/directories and delete them
+  for F in ${FILES}; do
+    echo "rm -rf ${F}"
+  done
+
+  # restore IFS
+  IFS=${IFSSAVE}
+else
+  echo "Skipping cleanup of old files..."
+fi
+
+echo "Syncing ${BRANCH} to ${WEBROOT}..."
+sudo rsync --super --chmod=Dg+s,ug+rw,Dug+X -rogl --exclude="private" --exclude=".git" --exclude=".gitignore" /tmp/clone/ ${WEBROOT}/
 
 # Just so we don't throw errors below when bash can't find the /tmp/clone directory
 cd ${HOME}
@@ -303,18 +351,18 @@ DEPLOY="## START DEPLOY INFO
 # ${DVERS}
 # ${BRANCH}
 # ${REPOSITORY}
-# ${ORG}
+# ${PROJ}
 ## END DEPLOY INFO
 "
 
 # Remove the previous DEPLOY INFO
-sudo sed -i '/START DEPLOY INFO/,/END DEPLOY INFO/d' /var/www/.htaccess
+sudo sed -i '/START DEPLOY INFO/,/END DEPLOY INFO/d' ${WEBROOT}/.htaccess
 
 # add the info to the end of the .htaccess file
-echo -e "${DEPLOY}" | sudo tee -a /var/www/.htaccess >/dev/null
+echo -e "${DEPLOY}" | sudo tee -a ${WEBROOT}/.htaccess >/dev/null
 
 # Find all .htaccess files and build include for apache
-HTACCESS=$(find {/var/www,/var/private,/var/mailinglist,/var/private_files} -name .htaccess 2>/dev/null)
+HTACCESS=$(find {${WEBROOT},/var/private,/var/mailinglist,/var/private_files} -name .htaccess 2>/dev/null)
 
 # Loop through the found files and create the include file for apache
 HTINCLUDE=""
@@ -331,7 +379,14 @@ sudo chmod 0644 /etc/apache2/htaccess.d/htaccess.conf
 echo "Reloading apache..."
 sudo apache2ctl graceful 2>/dev/null >/dev/null
 
+if [ ${CCALL} -eq 0 ]; then
+  echo "Cleaning site cache..."
+  GARBAGE=$(echo "flush_all" | nc localhost 11211; drush cc all;)
+else
+  echo "Skipped clearing site cache..."
+fi
+
 echo "Launch complete!"
 echo "Template for pasting to a related issue:"
-echo "Deployed ${HASH} with tag ${ENVIRON}-${TAG}. - ${ORG^^}/${REPO^^}"
+echo "Deployed ${HASH} with tag ${ENVIRON}-${TAG}. - ${PROJ^^}/${REPO^^}"
 echo

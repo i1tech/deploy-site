@@ -17,7 +17,7 @@ Current Deploy Information for this server:
 GitHub Organization: 
 ```
 
-Each deploy also creates a database backup. The backups are stored as `/var/dbbackup/${ENVIRON}-{TAG}.sql` using Drush.
+Each deploy also creates a database backup. The backups are stored as `/var/dbbackup/${ENVIRON}-{TAG}.sql` using Drush by default.
 
 ## Server-side configuration
 
